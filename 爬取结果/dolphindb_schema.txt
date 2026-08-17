@@ -1,0 +1,27 @@
+
+// DolphinDB 建表脚本
+// 连接数据库: login("admin", "123456")
+
+// 创建数据库
+db = database("dfs://dce_zhetin", RANGE, `effective_date)
+
+// 创建表结构
+schema = table(
+    100:0,
+    `announcement_id`publish_date`effective_date`title`announcement_type`variety`contract_specific
+    `limit_before`limit_after`margin_speculator_before`margin_speculator_after
+    `margin_hedger_before`margin_hedger_after`is_holiday_adjustment`link`content`crawl_time,
+    [LONG, DATE, DATE, STRING, STRING, STRING, STRING,
+     DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, INT, STRING, STRING, TIMESTAMP]
+)
+
+// 创建分区表
+pt = db.createPartitionedTable(schema, `zhetin_announcements, `effective_date,
+                                sortColumns=`announcement_id`effective_date, keepDuplicates=LAST)
+
+// 创建索引
+pt.createIndex("variety_idx", `variety)
+pt.createIndex("date_idx", `effective_date)
+pt.createIndex("type_idx", `announcement_type)
+
+print("✅ 数据库和表创建成功")
