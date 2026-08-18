@@ -61,6 +61,7 @@ class FuturesDataOrganizer:
 
     def extract_effective_dates(self, content):
         """提取所有生效日期及其位置"""
+        # 模式1：自X年X月X日结算时起
         date_pattern = r'自(\d{4})年(\d{1,2})月(\d{1,2})日[^\n]+?结算时起'
         dates = []
 
@@ -71,34 +72,92 @@ class FuturesDataOrganizer:
             date_str = f"{year}-{month}-{day}"
             dates.append((date_str, match.start(), match.end()))
 
+        # 模式2：X年X月X日恢复交易后（用于恢复至节前标准的情况）
+        recovery_pattern = r'(\d{4})年(\d{1,2})月(\d{1,2})日[^\n]*?恢复交易后'
+        for match in re.finditer(recovery_pattern, content):
+            year = match.group(1)
+            month = match.group(2).zfill(2)
+            day = match.group(3).zfill(2)
+            date_str = f"{year}-{month}-{day}"
+            dates.append((date_str, match.start(), match.end()))
+
+        # 按位置排序
+        dates.sort(key=lambda x: x[1])
+
         return dates
 
-    def extract_params_from_text(self, text):
-        """从文本中提取参数变化"""
+    def extract_params_from_text(self, text, is_holiday_context=False):
+        """从文本中提取参数变化
+
+        Args:
+            text: 参数文本
+            is_holiday_context: 是否在休市前后的上下文中（用于判断"恢复"是否为恢复至节前标准）
+        """
         params = {
             'limit': None,
             'margin_spec': None,
             'margin_hedge': None,
+            'margin_general': None,  # 通用的交易保证金（不区分投机/套保）
             'special_notes': [],  # 特殊说明（如"恢复"、"维持不变"等）
             'has_changes': False
         }
 
         # 0. 提取特殊说明（优先处理）
-        special_patterns = [
-            r'恢复[^。]*?(?:节前标准|原标准|原水平)',
+        special_patterns = []
+
+        # 只有在休市前后上下文中，才将"恢复"识别为恢复至节前标准
+        if is_holiday_context:
+            special_patterns.append(r'恢复')
+        else:
+            # 非休市上下文，只识别明确的"恢复至节前标准"等表述
+            special_patterns.append(r'恢复[^。]*?(?:节前标准|原标准|原水平)')
+
+        special_patterns.extend([
             r'维持不变',
             r'保持[^。]*?一致',
-            r'较大值',
-            r'仍为[^。]*?(\d+%)',  # "仍为X%"的情况
-        ]
+        ])
 
         for pattern in special_patterns:
             if re.search(pattern, text):
                 match = re.search(pattern, text)
                 if match:
                     note = match.group(0)
+                    # 如果匹配到的是"恢复"且在休市上下文中，统一显示为"恢复至节前标准"
+                    if note == '恢复' and is_holiday_context:
+                        note = '恢复至节前标准'
                     params['special_notes'].append(note)
                     params['has_changes'] = True
+
+        # 0.5. 提取"仍为"的情况（分别处理涨跌停板和保证金）
+        # 格式：涨跌停板幅度仍为X%，交易保证金水平仍为Y%
+        still_limit_pattern = r'涨跌停板[^。]*?仍为[^。]*?(\d+)'
+
+        # 投机和套期保证的"仍为"模式
+        still_spec_margin_pattern = r'投机[^和]*?交易保证金[^。]*?仍为[^。]*?(\d+)'
+        still_hedge_margin_pattern = r'套期保值[^和]*?交易保证金[^。]*?仍为[^。]*?(\d+)'
+        # 通用的"交易保证金...仍为"模式
+        still_margin_pattern = r'交易保证金[^。]*?仍为[^。]*?(\d+)'
+
+        limit_match = re.search(still_limit_pattern, text)
+        spec_margin_match = re.search(still_spec_margin_pattern, text)
+        hedge_margin_match = re.search(still_hedge_margin_pattern, text)
+        general_margin_match = re.search(still_margin_pattern, text)
+
+        if limit_match:
+            params['limit'] = ('仍为', limit_match.group(1) + '%')
+            params['has_changes'] = True
+
+        # 优先检查投机和套期保证的"仍为"
+        if spec_margin_match:
+            params['margin_spec'] = ('仍为', spec_margin_match.group(1) + '%')
+            params['has_changes'] = True
+        elif hedge_margin_match:
+            params['margin_hedge'] = ('仍为', hedge_margin_match.group(1) + '%')
+            params['has_changes'] = True
+        # 然后检查通用的"交易保证金...仍为"
+        elif general_margin_match:
+            params['margin_general'] = ('仍为', general_margin_match.group(1) + '%')
+            params['has_changes'] = True
 
         # 1. 优先处理"分别"模式（投机和套期保值一起）
         both_patterns = [
@@ -136,10 +195,16 @@ class FuturesDataOrganizer:
                     break
 
         # 3. 提取单独的保证金模式
-        if not params['margin_spec'] and not params['margin_hedge']:
+        if not params['margin_spec'] and not params['margin_hedge'] and not params['margin_general']:
+            # 优先检查投机和套期保值
             margin_patterns = [
+                # 投机交易保证金
                 r'投机[^和]*?交易保证金[^。]*?由[^。]*?(\d+%)[^。]*?调整为[^。]*?(\d+%)',
+                r'投机[^和]*?交易保证金[^。]*?调整为[^。]*?(\d+%)',
+                # 套期保值交易保证金
                 r'套期保值[^和]*?交易保证金[^。]*?由[^。]*?(\d+%)[^。]*?调整为[^。]*?(\d+%)',
+                r'套期保值[^和]*?交易保证金[^。]*?调整为[^。]*?(\d+%)',
+                # 通用的交易保证金（不区分投机/套保）
                 r'交易保证金[^。]*?由[^。]*?(\d+%)[^。]*?调整为[^。]*?(\d+%)',
                 r'交易保证金[^。]*?调整为[^。]*?(\d+%)',
             ]
@@ -148,13 +213,15 @@ class FuturesDataOrganizer:
                 match = re.search(pattern, text)
                 if match:
                     if '投机' in pattern:
-                        params['margin_spec'] = (match.group(1), match.group(2))
+                        params['margin_spec'] = (match.group(1), match.group(2)) if len(match.groups()) >= 2 else ('未明确', match.group(1))
                     elif '套期保值' in pattern:
-                        params['margin_hedge'] = (match.group(1), match.group(2))
+                        params['margin_hedge'] = (match.group(1), match.group(2)) if len(match.groups()) >= 2 else ('未明确', match.group(1))
                     elif '由' in pattern:
-                        params['margin_spec'] = (match.group(1), match.group(2))
+                        # 通用的交易保证金，有"由X%调整为Y%"格式
+                        params['margin_general'] = (match.group(1), match.group(2))
                     else:
-                        params['margin_spec'] = ('未明确', match.group(1))
+                        # 通用的交易保证金，只有"调整为X%"格式
+                        params['margin_general'] = ('未明确', match.group(1))
                     params['has_changes'] = True
                     break
 
@@ -223,8 +290,16 @@ class FuturesDataOrganizer:
         other = sorted(all_active - exclude)
         return other
 
-    def parse_product_changes_by_name(self, segment, product_name, product_code, effective_date):
-        """按品种名精确解析参数变化，避免重复"""
+    def parse_product_changes_by_name(self, segment, product_name, product_code, effective_date, is_holiday_context=False):
+        """按品种名精确解析参数变化，避免重复
+
+        Args:
+            segment: 文本段落
+            product_name: 产品名称
+            product_code: 产品代码
+            effective_date: 生效日期
+            is_holiday_context: 是否在休市前后的上下文中
+        """
         changes = []
         processed_ranges = []  # 存储已处理的文本范围 (start, end)
 
@@ -245,11 +320,18 @@ class FuturesDataOrganizer:
         specific_matches = list(re.finditer(specific_pattern, segment))
 
         # 模式1.5：处理多个产品名称组合的情况（如"棕榈油、乙二醇、苯乙烯和液化石油气品种期货合约"）
-        # 改进：更精确地匹配产品列表后的参数描述，避免跨句子匹配
-        # 格式：产品1、产品2和产品3品种期货合约参数...（；|。）
+        # 改进：支持产品在组合中的任意位置（开头、中间、结尾），支持任意数量的产品
+        # 格式：(产品1、)(产品2、)...产品N-1和产品N品种期货合约参数...；
+        # 重要：使用([^；]+)；只匹配到"；"之前的内容，确保不匹配到"；"之后
         multi_product_patterns = [
-            f'(?:[^、，]+、){0,2}{product_name}(?:、|和)[^、，]+品种期货合约([^。]*?)(?:；|。)',
-            f'(?:[^、，]+、){0,2}{product_name}(?:、|和)[^、，]+期货合约([^。]*?)(?:；|。)',
+            # 产品在开头：产品A、产品B、...、产品N-1和产品N品种期货合约...
+            # 匹配产品名开头，后跟任意数量的"产品、"或"产品和"，最后以"品种期货合约"结束
+            f'{product_name}(?:、[^、，]+)*(?:和[^、，]+)?品种期货合约([^；]+)；',
+            # 产品在中间：...、产品X、目标产品、...、产品N品种期货合约...
+            # 匹配前面有产品列表，后面还有产品的情况
+            f'(?:[^、]+、){1,3}{product_name}(?:、[^、，]+)*(?:和[^、，]+)?品种期货合约([^；]+)；',
+            # 产品在结尾（用"和"连接）：产品A、产品B、...和目标产品品种期货合约...
+            f'(?:[^、]+、){1,4}和{product_name}品种期货合约([^；]+)；',
         ]
         multi_matches = []
         for pattern in multi_product_patterns:
@@ -276,7 +358,7 @@ class FuturesDataOrganizer:
                 # 过滤已过期的合约
                 active_contracts = [c for c in contracts if not self.is_contract_expired(c, effective_date)]
                 if active_contracts:
-                    params = self.extract_params_from_text(contracts_text)
+                    params = self.extract_params_from_text(contracts_text, is_holiday_context)
                     if params and params['has_changes']:
                         changes.append({
                             'contracts': sorted(list(set(active_contracts))),
@@ -292,9 +374,32 @@ class FuturesDataOrganizer:
                 continue
             mark_processed(match.start(), match.end())
 
-            # 新的正则中参数在group(1)
-            params_text = match.group(1)
-            params = self.extract_params_from_text(params_text)
+            # 新的正则中参数在group(1)（如果只有一个分组）
+            # 需要检查实际的分组数量
+            params_text = match.group(1) if len(match.groups()) >= 1 else match.group(0)
+            # 从参数文本中提取真正的参数部分
+            # 格式通常是：品种期货合约涨跌停板幅度调整为X%，交易保证金水平调整为Y%
+            # 或者：恢复至节前标准
+            params_match = re.search(r'涨跌停板[^。]*?(?:调整为|仍为)[^。]*?[%\d]+[^。]*?(?:；|。|$)', params_text)
+            if params_match:
+                params_text = params_match.group(0)
+            else:
+                # 尝试保证金部分
+                margin_match = re.search(r'交易保证金[^。]*?(?:调整为|仍为)[^。]*?[%\d]+[^。]*?(?:；|。|$)', params_text)
+                if margin_match:
+                    params_text = margin_match.group(0)
+                else:
+                    # 尝试特殊说明（如"恢复至节前标准"）
+                    recovery_match = re.search(r'恢复[^。]*?(?:节前标准|原标准|原水平)[^。]*?(?:；|。|$)', params_text)
+                    if recovery_match:
+                        params_text = recovery_match.group(0)
+                    else:
+                        # 尝试"维持不变"
+                        unchanged_match = re.search(r'维持不变[^。]*?(?:；|。|$)', params_text)
+                        if unchanged_match:
+                            params_text = unchanged_match.group(0)
+
+            params = self.extract_params_from_text(params_text, is_holiday_context)
             if params and params['has_changes']:
                 # 生成该产品的所有有效合约
                 all_contracts = self.generate_all_contracts(product_code, effective_date)
@@ -306,9 +411,10 @@ class FuturesDataOrganizer:
                 })
 
         # 模式2：产品名 + 期货合约/品种期货合约 + 参数（没有具体合约代码，默认所有合约）
+        # 使用([^；]+)[；。]匹配到"；"/"。"之前的内容
         all_contract_patterns = [
-            f'{product_name}品种期货合约([^。]*?)(?:；|。)',
-            f'{product_name}期货合约([^。]*?)(?:；|。)',
+            f'{product_name}品种期货合约([^；]+)[；。]',
+            f'{product_name}期货合约([^；]+)[；。]',
         ]
 
         for pattern in all_contract_patterns:
@@ -320,7 +426,7 @@ class FuturesDataOrganizer:
                 mark_processed(match.start(), match.end())
 
                 params_text = match.group(1)
-                params = self.extract_params_from_text(params_text)
+                params = self.extract_params_from_text(params_text, is_holiday_context)
                 if params and params['has_changes']:
                     # 生成该产品的所有有效合约（排除已过期的）
                     all_contracts = self.generate_all_contracts(product_code, effective_date)
@@ -383,6 +489,10 @@ class FuturesDataOrganizer:
         if not effective_dates:
             return changes
 
+        # 检查是否为休市前后公告（包含"休市"、"长假"、"春节"、"国庆"等关键词）
+        is_holiday_announcement = any(keyword in content or keyword in title
+                                     for keyword in ['休市', '长假', '春节', '国庆', '劳动节', '端午节', '中秋节'])
+
         # 处理每个生效日期段
         for i, (date, start_pos, end_pos) in enumerate(effective_dates):
             if i + 1 < len(effective_dates):
@@ -392,9 +502,10 @@ class FuturesDataOrganizer:
                 segment = content[start_pos:]
 
             # 解析该段落中的产品变化
+            mentioned_products = set()
             for product_name, product_code in self.product_codes.items():
                 if product_name in segment or product_code in segment:
-                    product_changes = self.parse_product_changes_by_name(segment, product_name, product_code, date)
+                    product_changes = self.parse_product_changes_by_name(segment, product_name, product_code, date, is_holiday_announcement)
                     for change in product_changes:
                         changes.append({
                             'date': date,
@@ -403,6 +514,33 @@ class FuturesDataOrganizer:
                             'title': title,
                             **change
                         })
+                    mentioned_products.add(product_name)
+
+            # 检查是否有"其他品种"的描述
+            other_variety_pattern = r'其他品种期货合约[^。]*?维持不变'
+            other_match = re.search(other_variety_pattern, segment)
+            if other_match:
+                # 找出未提及的产品
+                for product_name, product_code in self.product_codes.items():
+                    if product_name not in mentioned_products:
+                        # 为未提及的产品添加"维持不变"记录
+                        all_contracts = self.generate_all_contracts(product_code, date)
+                        if all_contracts:
+                            changes.append({
+                                'date': date,
+                                'product': product_name,
+                                'contracts': all_contracts,
+                                'contract_type': '全部合约（其他品种）',
+                                'params': {
+                                    'limit': None,
+                                    'margin_general': None,
+                                    'special_notes': ['维持不变'],
+                                    'has_changes': True
+                                },
+                                'link': link,
+                                'title': title,
+                                'source_text': other_match.group(0)
+                            })
 
         return changes
 
@@ -419,20 +557,37 @@ class FuturesDataOrganizer:
             old_val, new_val = params['limit']
             if old_val == '未明确':
                 descriptions.append(f"涨跌停板幅度调整为{new_val}")
+            elif old_val == '仍为':
+                descriptions.append(f"涨跌停板幅度仍为{new_val}")
             else:
                 descriptions.append(f"涨跌停板幅度：{old_val} → {new_val}")
 
-        if params['margin_spec']:
+        # 优先显示通用的交易保证金（不区分投机/套保）
+        if params.get('margin_general'):
+            old_val, new_val = params['margin_general']
+            if old_val == '未明确':
+                descriptions.append(f"交易保证金调整为{new_val}")
+            elif old_val == '仍为':
+                descriptions.append(f"交易保证金仍为{new_val}")
+            else:
+                descriptions.append(f"交易保证金：{old_val} → {new_val}")
+        # 然后显示投机交易保证金
+        elif params.get('margin_spec'):
             old_val, new_val = params['margin_spec']
             if old_val == '未明确':
                 descriptions.append(f"投机交易保证金调整为{new_val}")
+            elif old_val == '仍为':
+                descriptions.append(f"投机交易保证金仍为{new_val}")
             else:
                 descriptions.append(f"投机交易保证金：{old_val} → {new_val}")
 
-        if params['margin_hedge']:
+        # 最后显示套期保值交易保证金
+        if params.get('margin_hedge'):
             old_val, new_val = params['margin_hedge']
-            if old_val != new_val or params['margin_spec'] != params['margin_hedge']:
-                descriptions.append(f"套期保值保证金：{old_val} → {new_val}")
+            if old_val == '仍为':
+                descriptions.append(f"套期保值交易保证金仍为{new_val}")
+            elif old_val != new_val or params.get('margin_spec') != params['margin_hedge']:
+                descriptions.append(f"套期保值交易保证金：{old_val} → {new_val}")
 
         return '; '.join(descriptions)
 
